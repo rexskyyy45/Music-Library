@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Personal Music Library</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>tailwind.config={theme:{extend:{colors:{sp:'#1db954'}}}}</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lucide-react@0.263.1/dist/umd/lucide-react.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="config.js"></script>
+<style>
+body{background:#000;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:#333;border-radius:8px}
+input.rng{-webkit-appearance:none;appearance:none;height:4px;border-radius:4px;outline:none;cursor:pointer}
+input.rng::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;border-radius:50%;background:#fff}
+input.rng::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;background:#fff}
+select option{background:#282828}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useMemo,useRef}=React;
+const L=window.lucideReact||{};
+const Ic=({n,size=18,...p})=>{const C=L[n];return C?<C size={size} {...p}/>:null};
+
+/* ============ Supabase (Auth + Postgres + Storage) ============ */
+const CFG=window.APP_CONFIG||{},BUCKET='music',SIGN=604800;
+const sb=CFG.SUPABASE_URL&&CFG.SUPABASE_ANON_KEY?supabase.createClient(CFG.SUPABASE_URL,CFG.SUPABASE_ANON_KEY):null;
+const must=r=>{if(r.error)throw r.error;return r.data};
+const fromRow=(r,cover)=>({id:r.id,title:r.title,artist:r.artist,album:r.album,genre:r.genre,year:r.year||'',duration:r.duration,size:r.size,favorite:r.favorite,plays:r.plays,addedAt:Date.parse(r.created_at),lastPlayed:r.last_played?Date.parse(r.last_played):0,filePath:r.file_path,coverPath:r.cover_path,cover:cover||null});
+const toRow=s=>({title:s.title,artist:s.artist,album:s.album,genre:s.genre,year:s.year===''?null:s.year,favorite:s.favorite,plays:s.plays,last_played:s.lastPlayed?new Date(s.lastPlayed).toISOString():null,cover_path:s.coverPath||null});
+const extOf=f=>((f.name&&f.name.match(/\.[^.]+$/))||[f.type==='image/png'?'.png':'.jpg'])[0].toLowerCase();
+const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,10);
+const putFile=async(user,kind,f)=>{const p=`${user}/${kind}/${uid()}${extOf(f)}`;must(await sb.storage.from(BUCKET).upload(p,f,{contentType:f.type||undefined}));return p};
+const rmFiles=paths=>{const l=paths.filter(Boolean);return l.length?sb.storage.from(BUCKET).remove(l):null};
+const signUrl=async p=>must(await sb.storage.from(BUCKET).createSignedUrl(p,SIGN)).signedUrl;
+const fetchAll=async()=>{
+  const rows=must(await sb.from('songs').select('*').order('created_at',{ascending:false}));
+  const cp=rows.map(r=>r.cover_path).filter(Boolean),m={};
+  if(cp.length)must(await sb.storage.from(BUCKET).createSignedUrls(cp,SIGN)).forEach(x=>{if(x.signedUrl)m[x.path]=x.signedUrl});
+  const pl=must(await sb.from('playlists').select('id,name,created_at,playlist_songs(song_id,created_at)').order('created_at'));
+  return [rows.map(r=>fromRow(r,m[r.cover_path])),pl.map(p=>({id:p.id,name:p.name,songIds:[...p.playlist_songs].sort((a,b)=>a.created_at<b.created_at?-1:1).map(x=>x.song_id)}))]};
+
+/* ============ Helpers ============ */
+const fmt=s=>{s=Math.round(s||0);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=String(s%60).padStart(2,'0');return h?`${h}:${String(m).padStart(2,'0')}:${x}`:`${m}:${x}`};
+const fmtLong=s=>{const h=Math.floor(s/3600),m=Math.round(s%3600/60);return h?`${h} j ${m} m`:`${m} m`};
+const urls=new WeakMap();
+const url=b=>!b?null:typeof b==='string'?b:(urls.get(b)||(urls.set(b,URL.createObjectURL(b)),urls.get(b)));
+const MAX=50*1024*1024,EXT=/\.(mp3|wav|ogg|oga|m4a|aac|flac|opus|weba)$/i;
+const probe=f=>new Promise(res=>{const a=new Audio(),u=URL.createObjectURL(f);
+  const done=v=>{URL.revokeObjectURL(u);res(v)};a.preload='metadata';
+  a.onloadedmetadata=()=>done(a.duration);a.onerror=()=>done(null);a.src=u});
+const readTags=f=>new Promise(res=>{try{jsmediatags.read(f,{onSuccess:({tags:t})=>{
+  const p=t.picture,cover=p?new Blob([new Uint8Array(p.data)],{type:p.format}):null;
+  res({title:t.title,artist:t.artist,album:t.album,genre:t.genre,year:parseInt(t.year)||'',cover})},onError:()=>res({})})}catch{res({})}});
+async function ingest(f,user){
+  if(!(f.type.startsWith('audio/')||EXT.test(f.name)))throw new Error('bukan file audio');
+  if(f.size>MAX)throw new Error('ukuran melebihi 50 MB');
+  const [dur,t]=await Promise.all([probe(f),readTags(f)]);
+  if(!dur||!isFinite(dur))throw new Error('format tidak didukung browser');
+  let fp,cp=null;
+  try{
+    fp=await putFile(user,'audio',f);if(t.cover)cp=await putFile(user,'covers',t.cover);
+    const r=must(await sb.from('songs').insert({title:(t.title||f.name.replace(/\.[^.]+$/,'')).slice(0,200),artist:t.artist||'Unknown Artist',album:t.album||'Unknown Album',genre:t.genre||'Other',year:t.year||null,duration:dur,size:f.size,file_path:fp,cover_path:cp}).select().single());
+    return fromRow(r,cp?await signUrl(cp):null);
+  }catch(e){await rmFiles([fp,cp]);throw e}
+}
+const CMP={added:(a,b)=>b.addedAt-a.addedAt,title:(a,b)=>a.title.localeCompare(b.title),artist:(a,b)=>a.artist.localeCompare(b.artist),genre:(a,b)=>a.genre.localeCompare(b.genre)};
+const inp='w-full bg-[#2a2a2a] rounded-md px-3 py-2 outline-none focus:ring-2 ring-sp',pri='bg-sp text-black font-bold rounded-full px-5 py-2 hover:scale-105 transition',sec='text-zinc-300 hover:text-white font-bold px-4 py-2',sel='bg-[#282828] rounded-full px-3 py-2 text-sm outline-none focus:ring-2 ring-sp';
+
+/* ============ Komponen reusable ============ */
+const Btn=({n,t,on,cls='',...p})=><button type="button" title={t} aria-label={t} onClick={on} className={`p-1.5 rounded-full text-zinc-400 hover:text-white hover:bg-white/10 transition ${cls}`}><Ic n={n} size={16} {...p}/></button>;
+const Cover=({s,cls=''})=>{const u=url(s.cover);return u?<img src={u} alt="" className={`object-cover ${cls}`}/>:<div className={`grid place-items-center bg-gradient-to-br from-zinc-700 to-zinc-900 text-zinc-400 ${cls}`}><Ic n="Music" size={22}/></div>};
+const Modal=({title,onClose,children})=><div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/70 sm:p-4" onMouseDown={e=>e.target===e.currentTarget&&onClose()}>
+  <div className="w-full sm:max-w-md bg-[#181818] rounded-t-2xl sm:rounded-2xl p-5 max-h-[90vh] overflow-auto">
+    <div className="flex items-center justify-between mb-4"><h3 className="font-bold text-lg">{title}</h3><Btn n="X" t="Tutup" on={onClose}/></div>{children}</div></div>;
+const Spin=({text})=><div className="flex items-center justify-center gap-3 p-16 text-zinc-400"><Ic n="Loader2" className="animate-spin text-sp" size={24}/>{text}</div>;
+const Range=({v,max,on,label})=>{const p=max?v/max*100:0;return <input type="range" aria-label={label} min="0" max={max} step="any" value={v} onChange={e=>on(+e.target.value)} className="rng w-full" style={{background:`linear-gradient(to right,#1db954 ${p}%,#4d4d4d ${p}%)`}}/>};
+const Stat=({ic,l,v})=><div className="bg-[#181818] rounded-xl p-4 flex items-center gap-4"><div className="w-11 h-11 rounded-lg bg-sp/15 text-sp grid place-items-center"><Ic n={ic} size={20}/></div><div><p className="text-2xl font-bold leading-tight">{v}</p><p className="text-xs text-zinc-400">{l}</p></div></div>;
+const Empty=({onPick})=><button onClick={onPick} className="w-full border-2 border-dashed border-white/20 hover:border-sp rounded-2xl p-10 sm:p-14 text-center text-zinc-400 hover:text-white transition">
+  <Ic n="Upload" size={36} className="mx-auto mb-3 text-sp"/><p className="font-bold text-white text-lg">Seret &amp; lepas lagu di sini</p>
+  <p className="text-sm mt-1">atau klik untuk memilih file: MP3, WAV, FLAC, M4A, OGG (maks. 50 MB per file)</p></button>;
+
+const Actions=({s,a})=><div className="flex items-center">
+  <Btn n="Heart" t={s.favorite?'Hapus dari favorit':'Tambah ke favorit'} on={()=>a.fav(s)} fill={s.favorite?'currentColor':'none'} cls={s.favorite?'!text-sp':''}/>
+  <Btn n="ListPlus" t="Tambah ke playlist" on={()=>a.addPl(s)}/>
+  {a.rm&&<Btn n="X" t="Keluarkan dari playlist" on={()=>a.rm(s)}/>}
+  <Btn n="Pencil" t="Edit metadata" on={()=>a.edit(s)}/>
+  <Btn n="Trash2" t="Hapus lagu" on={()=>a.del(s)} cls="hover:!text-red-400"/></div>;
+
+const Card=({s,a})=>{const on=a.cur===s.id;return <div className="group bg-[#181818] hover:bg-[#232323] rounded-lg p-3 transition">
+  <div className="relative mb-3"><Cover s={s} cls="w-full aspect-square rounded-md shadow-lg"/>
+    <button onClick={()=>a.play(s)} aria-label="Putar" className={`absolute right-2 bottom-2 w-11 h-11 rounded-full bg-sp text-black grid place-items-center shadow-xl transition md:group-hover:opacity-100 md:group-hover:translate-y-0 ${on?'':'md:opacity-0 md:translate-y-2'}`}><Ic n={on&&a.playing?'Pause':'Play'} size={20} fill="currentColor"/></button></div>
+  <p className={`truncate font-bold ${on?'text-sp':''}`} title={s.title}>{s.title}</p>
+  <p className="truncate text-sm text-zinc-400">{s.artist}</p><p className="truncate text-xs text-zinc-500">{s.album}{s.year?` (${s.year})`:''}</p>
+  <div className="flex items-center justify-between mt-2 -mx-1"><span className="text-xs text-zinc-500 pl-1">{fmt(s.duration)}</span><Actions s={s} a={a}/></div></div>};
+
+const Row=({s,a})=>{const on=a.cur===s.id;return <div className={`group flex items-center gap-3 px-2 py-2 rounded-md hover:bg-white/10 ${on?'bg-white/10':''}`}>
+  <button onClick={()=>a.play(s)} aria-label="Putar" className="relative w-11 h-11 shrink-0 rounded overflow-hidden"><Cover s={s} cls="w-11 h-11"/>
+    <span className={`absolute inset-0 grid place-items-center bg-black/60 group-hover:opacity-100 ${on?'':'opacity-0'}`}><Ic n={on&&a.playing?'Pause':'Play'} size={18} fill="currentColor"/></span></button>
+  <div className="min-w-0 flex-1"><p className={`truncate font-medium ${on?'text-sp':''}`}>{s.title}</p><p className="truncate text-sm text-zinc-400">{s.artist}</p></div>
+  <p className="hidden lg:block w-48 truncate text-sm text-zinc-400">{s.album}</p>
+  <p className="hidden sm:block w-24 truncate text-sm text-zinc-400">{s.genre}</p>
+  <span className="text-sm text-zinc-400 w-12 text-right">{fmt(s.duration)}</span><Actions s={s} a={a}/></div>};
+
+const Songs=({list,a,mode})=>{const A={...a,play:s=>a.play(s,list)};
+  return mode==='grid'?<div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">{list.map(s=><Card key={s.id} s={s} a={A}/>)}</div>
+  :<div className="flex flex-col">{list.map(s=><Row key={s.id} s={s} a={A}/>)}</div>};
+
+const EditSong=({s,onClose,onSave})=>{
+  const [f,setF]=useState({title:s.title,artist:s.artist,album:s.album,genre:s.genre,year:s.year||''}),[cover,setCover]=useState(s.cover),[err,setErr]=useState({});
+  const pick=e=>{const x=e.target.files[0];if(!x)return;
+    if(!x.type.startsWith('image/'))return setErr({cover:'File cover harus berupa gambar'});
+    if(x.size>5e6)return setErr({cover:'Ukuran cover maksimal 5 MB'});setErr({});setCover(x)};
+  const submit=e=>{e.preventDefault();const er={},y=f.year===''?'':+f.year;
+    if(!f.title.trim())er.title='Judul wajib diisi';
+    if(y!==''&&(!Number.isInteger(y)||y<1900||y>new Date().getFullYear()+1))er.year='Masukkan tahun 1900 sampai sekarang';
+    setErr(er);if(Object.keys(er).length)return;
+    onSave({...s,title:f.title.trim(),artist:f.artist.trim()||'Unknown Artist',album:f.album.trim()||'Unknown Album',genre:f.genre.trim()||'Other',year:y,cover})};
+  const cu=url(cover);
+  return <form onSubmit={submit} className="space-y-3">
+    <div className="flex items-center gap-4"><Cover s={{cover}} cls="w-24 h-24 rounded-md shrink-0"/>
+      <div className="text-sm min-w-0"><input type="file" accept="image/*" onChange={pick} className="w-full text-zinc-400 file:mr-3 file:rounded-full file:border-0 file:bg-[#2a2a2a] file:text-white file:px-3 file:py-1.5"/>
+      {cu&&<button type="button" onClick={()=>setCover(null)} className="text-red-400 mt-2">Hapus cover</button>}
+      {err.cover&&<p className="text-red-400 mt-1">{err.cover}</p>}</div></div>
+    {[['title','Judul'],['artist','Artis'],['album','Album'],['genre','Genre'],['year','Tahun']].map(([k,l])=><label key={k} className="block text-sm text-zinc-300">{l}
+      <input value={f[k]} onChange={e=>setF({...f,[k]:e.target.value})} inputMode={k==='year'?'numeric':undefined} className={inp+' mt-1'}/>
+      {err[k]&&<span className="text-red-400">{err[k]}</span>}</label>)}
+    <div className="flex justify-end gap-2 pt-2"><button type="button" onClick={onClose} className={sec}>Batal</button><button className={pri}>Simpan</button></div></form>};
+
+const NewPl=({names,onSave,onClose})=>{const [n,setN]=useState(''),[e,setE]=useState('');
+  const go=ev=>{ev.preventDefault();const v=n.trim();if(!v)return setE('Nama playlist wajib diisi');if(names.includes(v.toLowerCase()))return setE('Nama playlist sudah dipakai');onSave(v)};
+  return <form onSubmit={go}><input autoFocus maxLength={40} value={n} onChange={x=>setN(x.target.value)} placeholder="Nama playlist" className={inp}/>
+    {e&&<p className="text-red-400 text-sm mt-1">{e}</p>}
+    <div className="flex justify-end gap-2 mt-5"><button type="button" onClick={onClose} className={sec}>Batal</button><button className={pri}>Buat playlist</button></div></form>};
+
+const Sidebar=({view,go,pls,newPl,fileRef,user,onLogout})=>{
+  const item=(t,n,label,id)=>{const on=view.t===t&&view.id===id;return <button key={t+id} onClick={()=>go({t,id})} className={`flex items-center gap-3 w-full px-3 py-2 rounded-md font-medium transition ${on?'text-white bg-white/10':'text-zinc-400 hover:text-white'}`}><Ic n={n} size={20} className={on?'text-sp':''}/><span className="truncate">{label}</span></button>};
+  return <div className="flex flex-col gap-1 p-4 h-full bg-black overflow-auto">
+    <div className="flex items-center gap-2 px-2 py-3 mb-3"><div className="w-9 h-9 rounded-lg bg-sp text-black grid place-items-center"><Ic n="Music" size={20}/></div><span className="font-extrabold text-lg leading-tight">Music<br/>Library</span></div>
+    {item('home','Home','Beranda')}{item('library','Library','Pustaka Lagu')}{item('favorites','Heart','Favorit')}{item('recent','History','Terakhir Diputar')}
+    <div className="flex items-center justify-between mt-6 mb-1 px-3 text-zinc-400"><span className="text-sm font-bold">Playlist</span><Btn n="Plus" t="Buat playlist" on={newPl}/></div>
+    {pls.length===0&&<p className="px-3 text-sm text-zinc-500">Belum ada playlist.</p>}
+    {pls.map(p=>item('playlist','ListMusic',`${p.name}`,p.id))}
+    <div className="mt-auto pt-4 flex items-center gap-2 px-3 text-sm text-zinc-400"><span className="truncate flex-1" title={user.email}>{user.email}</span><Btn n="LogOut" t="Keluar" on={onLogout}/></div></div>};
+
+const Player=({au,s,playing,vol,setVol,toggle,step,fav})=>{
+  const [t,setT]=useState(0),[d,setD]=useState(0);
+  useEffect(()=>{const a=au.current,u=()=>{setT(a.currentTime||0);setD(isFinite(a.duration)?a.duration:0)},ev=['timeupdate','loadedmetadata'];
+    ev.forEach(e=>a.addEventListener(e,u));return()=>ev.forEach(e=>a.removeEventListener(e,u))},[]);
+  const b='p-2 text-zinc-300 hover:text-white disabled:opacity-40 disabled:hover:text-zinc-300';
+  return <footer className="bg-[#0b0b0b] border-t border-white/10 px-3 sm:px-5 py-2 grid md:grid-cols-3 items-center gap-2">
+    <div className="flex items-center gap-3 min-w-0">{s?<><Cover s={s} cls="w-12 h-12 rounded shrink-0"/>
+      <div className="min-w-0 flex-1"><p className="truncate font-medium text-sm">{s.title}</p><p className="truncate text-xs text-zinc-400">{s.artist}</p></div>
+      <Btn n="Heart" t="Favorit" on={()=>fav(s)} fill={s.favorite?'currentColor':'none'} cls={s.favorite?'!text-sp':''}/></>
+      :<p className="text-sm text-zinc-500">Pilih lagu untuk mulai memutar</p>}</div>
+    <div className="flex flex-col items-center gap-1">
+      <div className="flex items-center gap-3">
+        <button disabled={!s} onClick={()=>step(-1)} className={b} aria-label="Sebelumnya"><Ic n="SkipBack" size={20} fill="currentColor"/></button>
+        <button disabled={!s} onClick={toggle} aria-label={playing?'Jeda':'Putar'} className="w-10 h-10 rounded-full bg-white text-black grid place-items-center hover:scale-105 disabled:opacity-40 transition"><Ic n={playing?'Pause':'Play'} size={20} fill="currentColor"/></button>
+        <button disabled={!s} onClick={()=>step(1)} className={b} aria-label="Berikutnya"><Ic n="SkipForward" size={20} fill="currentColor"/></button></div>
+      <div className="flex items-center gap-2 w-full max-w-xl text-xs text-zinc-400"><span className="w-10 text-right">{fmt(t)}</span><Range v={t} max={d} on={v=>{au.current.currentTime=v}} label="Progres lagu"/><span className="w-10">{fmt(d)}</span></div></div>
+    <div className="hidden md:flex items-center justify-end gap-2"><button onClick={()=>setVol(vol?0:.8)} className={b} aria-label="Bisukan"><Ic n={vol?'Volume2':'VolumeX'}/></button><div className="w-28"><Range v={vol} max={1} on={setVol} label="Volume"/></div></div></footer>};
+
+/* ============ Aplikasi utama ============ */
+function Library({user,onLogout}){
+  const [songs,setSongs]=useState([]),[pls,setPls]=useState([]),[ready,setReady]=useState(false),[fatal,setFatal]=useState(null);
+  const [view,setView]=useState({t:'home'}),[q,setQ]=useState(''),[sort,setSort]=useState('added'),[genre,setGenre]=useState('all'),[mode,setMode]=useState('grid');
+  const [cur,setCur]=useState(null),[queue,setQueue]=useState([]),[playing,setPlaying]=useState(false),[vol,setVol]=useState(.8);
+  const [modal,setModal]=useState(null),[toasts,setToasts]=useState([]),[busy,setBusy]=useState(null),[drag,setDrag]=useState(false),[drawer,setDrawer]=useState(false);
+  const au=useRef(),fi=useRef(),close=()=>setModal(null);
+
+  const rd=useRef(false);
+  const load=()=>fetchAll().then(([s,p])=>{setSongs(s);setPls(p);setReady(true);rd.current=true}).catch(e=>rd.current?toast('Gagal sinkronisasi: '+e.message,'err'):setFatal(e.message||'Gagal memuat data dari server'));
+  useEffect(()=>{load();let t;const re=()=>{clearTimeout(t);t=setTimeout(load,600)};
+    const ch=sb.channel('sync-'+user.id).on('postgres_changes',{event:'*',schema:'public'},re).subscribe();
+    const vis=()=>document.visibilityState==='visible'&&re();document.addEventListener('visibilitychange',vis);
+    return()=>{clearTimeout(t);sb.removeChannel(ch);document.removeEventListener('visibilitychange',vis)}},[]);
+  useEffect(()=>{au.current.volume=vol},[vol]);
+
+  const toast=(m,t='ok')=>{const id=Math.random();setToasts(p=>[...p,{id,m,t}]);setTimeout(()=>setToasts(p=>p.filter(x=>x.id!==id)),4000)};
+  const run=async(fn,ok)=>{try{await fn();ok&&toast(ok)}catch(e){toast(e.message||'Terjadi kesalahan','err')}};
+  const save=async s=>{must(await sb.from('songs').update(toRow(s)).eq('id',s.id));setSongs(p=>p.map(x=>x.id===s.id?s:x))};
+  const saveEdit=async s=>{const old=songs.find(x=>x.id===s.id);let cp=old.coverPath,cu=s.cover;
+    if(s.cover instanceof Blob){cp=await putFile(user.id,'covers',s.cover);cu=await signUrl(cp)}else if(!s.cover)cp=null;
+    try{await save({...s,coverPath:cp,cover:cu})}catch(e){if(cp!==old.coverPath)await rmFiles([cp]);throw e}
+    if(cp!==old.coverPath)await rmFiles([old.coverPath])};
+
+  const song=songs.find(s=>s.id===cur);
+  useEffect(()=>{if(!song)return;let dead=false;const a=au.current;
+    signUrl(song.filePath).then(u=>{if(dead)return;a.src=u;a.play().catch(()=>{})}).catch(e=>toast('Gagal memuat audio: '+e.message,'err'));
+    const lp=Date.now(),n=(song.plays||0)+1;
+    sb.from('songs').update({plays:n,last_played:new Date(lp).toISOString()}).eq('id',song.id).then(r=>!r.error&&setSongs(p=>p.map(x=>x.id===song.id?{...x,plays:n,lastPlayed:lp}:x)));
+    return()=>{dead=true}},[cur]);
+  const toggle=()=>{const a=au.current;a.paused?a.play():a.pause()};
+  const play=(s,ctx)=>{if(s.id===cur)return toggle();setQueue(ctx.map(x=>x.id));setCur(s.id)};
+  const step=d=>{const a=au.current,qq=queue.filter(i=>songs.some(s=>s.id===i));if(!qq.length||!song)return;
+    if(d<0&&a.currentTime>3){a.currentTime=0;return}
+    const n=qq[(qq.indexOf(cur)+d+qq.length)%qq.length];if(n===cur){a.currentTime=0;a.play()}else setCur(n)};
+
+  const upload=async files=>{files=[...files];if(!files.length)return;setBusy(`Memproses ${files.length} file…`);let ok=0;
+    for(const f of files){try{const s=await ingest(f,user.id);setSongs(p=>p.some(x=>x.id===s.id)?p:[s,...p]);ok++}catch(e){toast(`${f.name}: ${e.message}`,'err')}}
+    setBusy(null);ok&&toast(`${ok} lagu berhasil ditambahkan`)};
+  const delSong=s=>run(async()=>{must(await sb.from('songs').delete().eq('id',s.id));rmFiles([s.filePath,s.coverPath]);
+    setSongs(p=>p.filter(x=>x.id!==s.id));setPls(l=>l.map(p=>({...p,songIds:p.songIds.filter(i=>i!==s.id)})));
+    if(cur===s.id){au.current.pause();au.current.removeAttribute('src');setCur(null)}},'Lagu dihapus');
+  const togglePl=(p,s)=>run(async()=>{const has=p.songIds.includes(s.id),t=sb.from('playlist_songs');
+    must(await(has?t.delete().eq('playlist_id',p.id).eq('song_id',s.id):t.insert({playlist_id:p.id,song_id:s.id})));
+    setPls(l=>l.map(x=>x.id===p.id?{...x,songIds:has?x.songIds.filter(i=>i!==s.id):[...x.songIds,s.id]}:x));
+    toast(has?`Dikeluarkan dari ${p.name}`:`Ditambahkan ke ${p.name}`)});
+  const createPl=async(name,sid)=>{const r=must(await sb.from('playlists').insert({name}).select().single());
+    if(sid)must(await sb.from('playlist_songs').insert({playlist_id:r.id,song_id:sid}));
+    const n={id:r.id,name:r.name,songIds:sid?[sid]:[]};setPls(l=>[...l,n]);return n};
+  const go=v=>{setView(v);setGenre('all');setDrawer(false)};
+  const delPl=p=>run(async()=>{must(await sb.from('playlists').delete().eq('id',p.id));setPls(l=>l.filter(x=>x.id!==p.id));go({t:'home'})},'Playlist dihapus');
+
+  const pl=view.t==='playlist'?pls.find(p=>p.id===view.id):null;
+  const base=useMemo(()=>{
+    if(view.t==='favorites')return songs.filter(s=>s.favorite);
+    if(view.t==='recent')return songs.filter(s=>s.lastPlayed).sort((a,b)=>b.lastPlayed-a.lastPlayed).slice(0,50);
+    if(view.t==='playlist')return(pl?pl.songIds:[]).map(i=>songs.find(s=>s.id===i)).filter(Boolean);
+    return songs},[songs,view,pls]);
+  const list=useMemo(()=>{const k=q.trim().toLowerCase();
+    const l=base.filter(s=>(genre==='all'||s.genre===genre)&&(!k||[s.title,s.artist,s.album,s.genre].join(' ').toLowerCase().includes(k)));
+    return view.t==='recent'?l:[...l].sort(CMP[sort])},[base,q,genre,sort,view.t]);
+  const genres=useMemo(()=>[...new Set(base.map(s=>s.genre))].sort(),[base]);
+  const stats={songs:songs.length,albums:new Set(songs.map(s=>s.album)).size,artists:new Set(songs.map(s=>s.artist)).size,dur:songs.reduce((t,s)=>t+s.duration,0)};
+
+  const a={cur,playing,play,fav:s=>run(()=>save({...s,favorite:!s.favorite})),addPl:s=>setModal({k:'pl',s}),edit:s=>setModal({k:'edit',s}),
+    del:s=>setModal({k:'del',title:'Hapus lagu?',msg:`“${s.title}” akan dihapus permanen dari perpustakaanmu. Tindakan ini tidak bisa dibatalkan.`,ok:()=>delSong(s)}),
+    rm:pl?s=>togglePl(pl,s):null};
+  const title=pl?pl.name:{home:'Beranda',library:'Pustaka Lagu',favorites:'Favorit',recent:'Terakhir Diputar'}[view.t]||'';
+  const side=<Sidebar view={view} go={go} pls={pls} fileRef={fi} user={user} onLogout={onLogout} newPl={()=>setModal({k:'newpl'})}/>;
+  const none=view.t==='playlist'?'Playlist ini masih kosong. Tambahkan lagu lewat ikon playlist di setiap lagu.':view.t==='favorites'?'Belum ada lagu favorit. Tekan ikon hati pada lagu.':view.t==='recent'?'Belum ada riwayat. Putar lagu untuk mulai mencatat.':'Tidak ada lagu yang cocok dengan pencarian atau filter.';
+
+  return <div className="h-[100dvh] flex flex-col bg-[#121212] text-white"
+    onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={e=>!e.relatedTarget&&setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);upload(e.dataTransfer.files)}}>
+    <audio ref={au} onPlay={()=>setPlaying(true)} onPause={()=>setPlaying(false)} onEnded={()=>step(1)} onError={()=>au.current.getAttribute('src')&&toast('Lagu tidak dapat diputar. Coba upload ulang file-nya.','err')}/>
+    <input ref={fi} type="file" multiple hidden accept="audio/*,.mp3,.wav,.flac,.m4a,.ogg,.aac,.opus" onChange={e=>{upload(e.target.files);e.target.value=''}}/>
+    {drag&&<div className="fixed inset-0 z-[70] grid place-items-center bg-black/80 border-4 border-dashed border-sp pointer-events-none text-xl font-bold"><div className="text-center"><Ic n="Upload" size={48} className="mx-auto mb-3 text-sp"/>Lepaskan file untuk menambahkan lagu</div></div>}
+    {fatal?<div className="flex-1 grid place-items-center p-6 text-center"><div><Ic n="AlertTriangle" size={40} className="mx-auto mb-3 text-red-400"/><p className="font-bold text-lg">Data tidak dapat dimuat</p><p className="text-zinc-400 my-2">{fatal}. Periksa koneksi internet dan konfigurasi Supabase.</p><button className={pri} onClick={()=>location.reload()}>Coba lagi</button></div></div>
+    :<><div className="flex flex-1 min-h-0">
+      <aside className="hidden md:block w-64 shrink-0">{side}</aside>
+      {drawer&&<div className="fixed inset-0 z-40 md:hidden bg-black/70" onClick={()=>setDrawer(false)}><aside className="w-64 h-full" onClick={e=>e.stopPropagation()}>{side}</aside></div>}
+      <main className="flex-1 min-w-0 overflow-auto bg-gradient-to-b from-[#173d27] via-[#121212] to-[#121212] bg-[length:100%_340px] bg-no-repeat">
+        <header className="sticky top-0 z-20 flex items-center gap-3 px-4 md:px-8 py-3 bg-[#121212]/80 backdrop-blur">
+          <button className="md:hidden p-1" aria-label="Menu" onClick={()=>setDrawer(true)}><Ic n="Menu" size={22}/></button>
+          <div className="relative flex-1 max-w-md"><Ic n="Search" size={18} className="absolute left-3 top-2.5 text-zinc-400"/>
+            <input value={q} onChange={e=>{setQ(e.target.value);if(view.t==='home')go({t:'library'})}} placeholder="Cari judul, artis, album, genre" className="w-full bg-[#2a2a2a] rounded-full pl-10 pr-4 py-2 text-sm outline-none focus:ring-2 ring-sp"/></div>
+          <button onClick={()=>fi.current.click()} className={pri+' ml-auto flex items-center gap-2 !px-4'}><Ic n="Upload" size={16}/><span className="hidden sm:inline">Upload lagu</span></button></header>
+        <div className="px-4 md:px-8 pb-10 pt-2">
+          {busy&&<div className="flex items-center gap-2 mb-4 text-sm text-sp"><Ic n="Loader2" className="animate-spin" size={16}/>{busy}</div>}
+          {!ready?<Spin text="Memuat perpustakaan…"/>
+          :view.t==='home'?<>
+            <h1 className="text-3xl font-extrabold mb-5">Perpustakaan musikmu</h1>
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-8"><Stat ic="Music" l="Lagu" v={stats.songs}/><Stat ic="Disc" l="Album" v={stats.albums}/><Stat ic="Users" l="Artis" v={stats.artists}/><Stat ic="Clock" l="Total durasi" v={fmtLong(stats.dur)}/></div>
+            {songs.length===0?<Empty onPick={()=>fi.current.click()}/>:<>
+              {songs.some(s=>s.lastPlayed)&&<><h2 className="text-xl font-bold mb-3">Terakhir diputar</h2><div className="mb-8"><Songs mode="grid" a={a} list={[...songs].filter(s=>s.lastPlayed).sort((x,y)=>y.lastPlayed-x.lastPlayed).slice(0,5)}/></div></>}
+              <h2 className="text-xl font-bold mb-3">Baru ditambahkan</h2><Songs mode="grid" a={a} list={[...songs].sort(CMP.added).slice(0,10)}/></>}</>
+          :<>
+            <div className="flex flex-wrap items-center gap-3 mb-5 mt-2"><div className="flex-1 min-w-[10rem]"><h1 className="text-3xl font-extrabold truncate">{title}</h1><p className="text-sm text-zinc-400">{list.length} lagu</p></div>
+              {pl&&<Btn n="Trash2" t="Hapus playlist" cls="hover:!text-red-400" on={()=>setModal({k:'del',title:'Hapus playlist?',msg:`Playlist “${pl.name}” akan dihapus. Lagu di dalamnya tetap ada di pustaka.`,ok:()=>delPl(pl)})}/>}
+              {view.t!=='recent'&&<select value={sort} onChange={e=>setSort(e.target.value)} className={sel} aria-label="Urutkan"><option value="added">Terbaru diupload</option><option value="title">Judul A–Z</option><option value="artist">Artis A–Z</option><option value="genre">Genre A–Z</option></select>}
+              <select value={genre} onChange={e=>setGenre(e.target.value)} className={sel} aria-label="Filter genre"><option value="all">Semua genre</option>{genres.map(g=><option key={g}>{g}</option>)}</select>
+              <div className="flex bg-[#282828] rounded-full p-1">{[['grid','LayoutGrid','Tampilan grid'],['list','List','Tampilan daftar']].map(([m,n,t])=><button key={m} title={t} aria-label={t} onClick={()=>setMode(m)} className={`p-1.5 rounded-full ${mode===m?'bg-sp text-black':'text-zinc-400 hover:text-white'}`}><Ic n={n} size={16}/></button>)}</div></div>
+            {songs.length===0&&view.t==='library'?<Empty onPick={()=>fi.current.click()}/>:list.length===0?<p className="text-zinc-400 py-16 text-center">{none}</p>:<Songs list={list} a={a} mode={mode}/>}</>}
+        </div></main></div>
+      <Player au={au} s={song} playing={playing} vol={vol} setVol={setVol} toggle={toggle} step={step} fav={a.fav}/></>}
+    <div className="fixed bottom-36 md:bottom-28 left-1/2 -translate-x-1/2 z-[60] space-y-2 w-[92vw] max-w-sm pointer-events-none">{toasts.map(t=><div key={t.id} className={`rounded-lg px-4 py-3 text-sm font-medium shadow-xl ${t.t==='err'?'bg-red-600':'bg-white text-black'}`}>{t.m}</div>)}</div>
+    {modal&&modal.k==='edit'&&<Modal title="Edit metadata" onClose={close}><EditSong s={modal.s} onClose={close} onSave={s=>{run(()=>saveEdit(s),'Metadata disimpan');close()}}/></Modal>}
+    {modal&&modal.k==='del'&&<Modal title={modal.title} onClose={close}><p className="text-zinc-300 mb-5">{modal.msg}</p><div className="flex justify-end gap-2"><button onClick={close} className={sec}>Batal</button><button onClick={()=>{modal.ok();close()}} className="bg-red-500 text-white font-bold rounded-full px-5 py-2 hover:bg-red-400">Hapus</button></div></Modal>}
+    {modal&&modal.k==='pl'&&<Modal title="Tambah ke playlist" onClose={close}>{pls.length?pls.map(p=><button key={p.id} onClick={()=>togglePl(p,modal.s)} className="flex w-full items-center justify-between px-3 py-3 rounded-md hover:bg-white/10"><span className="truncate">{p.name}</span>{p.songIds.includes(modal.s.id)&&<Ic n="Check" className="text-sp"/>}</button>):<p className="text-zinc-400 text-sm">Belum ada playlist.</p>}<button onClick={()=>setModal({k:'newpl',s:modal.s})} className="mt-3 text-sp text-sm font-bold">+ Playlist baru</button></Modal>}
+    {modal&&modal.k==='newpl'&&<Modal title="Playlist baru" onClose={close}><NewPl names={pls.map(p=>p.name.toLowerCase())} onClose={close} onSave={n=>run(async()=>{const p=await createPl(n,modal.s&&modal.s.id);close();modal.s||go({t:'playlist',id:p.id})},'Playlist dibuat')}/></Modal>}
+  </div>;
+}
+/* ============ Autentikasi ============ */
+const Auth=()=>{
+  const [m,setM]=useState('in'),[e,setE]=useState(''),[p,setP]=useState(''),[err,setErr]=useState(''),[info,setInfo]=useState(''),[b,setB]=useState(false);
+  const submit=async ev=>{ev.preventDefault();setErr('');setInfo('');
+    if(!/^\S+@\S+\.\S+$/.test(e))return setErr('Format email tidak valid');
+    if(p.length<6)return setErr('Password minimal 6 karakter');
+    setB(true);
+    const r=m==='in'?await sb.auth.signInWithPassword({email:e,password:p}):await sb.auth.signUp({email:e,password:p});
+    setB(false);
+    if(r.error)setErr(r.error.message);else if(m==='up'&&!r.data.session)setInfo('Akun dibuat. Cek email untuk konfirmasi, lalu masuk.')};
+  return <div className="min-h-screen grid place-items-center bg-gradient-to-b from-[#173d27] to-black p-4 text-white"><form onSubmit={submit} className="w-full max-w-sm bg-[#121212] rounded-2xl p-6 space-y-4">
+    <div className="flex items-center gap-3"><div className="w-10 h-10 rounded-lg bg-sp text-black grid place-items-center"><Ic n="Music" size={22}/></div><div><h1 className="font-extrabold text-xl leading-tight">Music Library</h1><p className="text-sm text-zinc-400">{m==='in'?'Masuk ke koleksi pribadimu':'Buat akun baru'}</p></div></div>
+    <input type="email" autoComplete="email" placeholder="Email" value={e} onChange={x=>setE(x.target.value)} className={inp}/>
+    <input type="password" autoComplete={m==='in'?'current-password':'new-password'} placeholder="Password" value={p} onChange={x=>setP(x.target.value)} className={inp}/>
+    {err&&<p className="text-red-400 text-sm">{err}</p>}{info&&<p className="text-sp text-sm">{info}</p>}
+    <button disabled={b} className={pri+' w-full disabled:opacity-60'}>{b?'Memproses…':m==='in'?'Masuk':'Daftar'}</button>
+    <button type="button" onClick={()=>{setM(m==='in'?'up':'in');setErr('');setInfo('')}} className="w-full text-sm text-zinc-400 hover:text-white">{m==='in'?'Belum punya akun? Daftar':'Sudah punya akun? Masuk'}</button></form></div>};
+function Root(){
+  const [ses,setSes]=useState(undefined);
+  useEffect(()=>{if(!sb)return;sb.auth.getSession().then(({data})=>setSes(data.session));
+    const {data}=sb.auth.onAuthStateChange((_e,x)=>setSes(x));return()=>data.subscription.unsubscribe()},[]);
+  if(!sb)return <div className="min-h-screen grid place-items-center bg-black text-white p-6 text-center"><div><Ic n="AlertTriangle" size={40} className="mx-auto mb-3 text-red-400"/><p className="font-bold text-lg">Konfigurasi Supabase belum diisi</p><p className="text-zinc-400 mt-2 max-w-md">Isi SUPABASE_URL dan SUPABASE_ANON_KEY di file .env (lokal) atau Environment Variables Vercel, lalu jalankan <code>node build.js</code>.</p></div></div>;
+  if(ses===undefined)return <div className="min-h-screen bg-black text-white grid place-items-center"><Spin text="Memuat…"/></div>;
+  return ses?<Library key={ses.user.id} user={ses.user} onLogout={()=>{sb.auth.signOut()}}/>:<Auth/>};
+ReactDOM.createRoot(document.getElementById('root')).render(<Root/>);
+</script>
+</body>
+</html>
